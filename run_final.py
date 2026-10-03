@@ -99,6 +99,25 @@ ap.add_argument('--label_fix', action='store_true',
                 help='[개선1] 라벨 정합성 점검 옵션. 과거 점수 P 계산 시 view_5d 측정이 끝까지 가능한 '
                      '(published_at + 5일 <= 데이터 끝) 롱폼만 사용해, 측정이 덜 된 최근 영상이 '
                      'eligibility/과거중앙값을 흔드는 것을 줄인다. 공식 08-11 라벨과의 1.5% 불일치 원인 점검용')
+# ── 3차 개선 플래그 (기본 off, 켜지 않으면 1·2차까지의 파이프라인이 그대로 재현된다) ─────────────
+#    라벨/타깃 정합성 + q-모형 통합 개편. 모두 독립 argparse 플래그이며 반드시 --lag1feat --lag1q 와 함께 평가.
+ap.add_argument('--label_diag', action='store_true',
+                help='[3차-진단] 라벨 정합성 진단 모드. 공식 train_labels.csv(08-11, 08-25)와 '
+                     '재구성 라벨(label())을 채널별로 비교해 불일치 수와 원인별 분해를 출력하고 종료한다. '
+                     '원인 분해: eligibility(채점 대상 포함/배제 차이), 라벨값(둘 다 대상인데 0/1 다름), '
+                     '측정가능(published_at+5일이 데이터 끝을 넘는 최근 영상이 섞였는지). 학습/제출에는 영향 없음.')
+ap.add_argument('--label_measurable', action='store_true',
+                help='[3차-1] 라벨 정합성 교정: 과거 점수 P·eligibility·미래 점수 Q 를 계산할 때 '
+                     'view_5d 측정이 실제로 끝까지 가능한(published_at + 5일 <= 데이터 끝 C) 롱폼만 쓴다. '
+                     '측정이 덜 된 최근 영상이 P·eligibility·Q 를 흔드는 것을 줄여 공식 라벨과의 1.5% 불일치를 교정. '
+                     '--label_fix(동점 처리)와 독립적으로 조합 가능. 누수 없음(측정 가능 여부는 D 이전 정보).')
+ap.add_argument('--q_joint', action='store_true',
+                help='[3차-2] q-모형 통합 개편. k/F 통합 모형(--q_uni)·관측-질 신호(--lag1q 의 q_conc/q_nrise)·'
+                     'EM(--q_em)을 개별이 아니라 하나의 통합 q-모형에서 함께 작동하도록 재설계한다. '
+                     'k/F(kfrac)를 입력으로 모든 관측길이를 한 번에 학습하되, 그 안에 관측-질 신호(q_conc/q_nrise/q_lag)와 '
+                     'kfrac×관측-질 상호작용을 함께 넣어 "얼마나 봤는지(k/F)"와 "본 상승의 질"이 결합해 q 를 결정하게 한다. '
+                     '소프트 라벨 가중 w(--soft_k 의 관측비율)와 완전 호환. --lag1feat --lag1q 와 함께 켤 것. '
+                     '(단독 실패했던 --q_uni/--q_em 과 달리 결합 시너지를 노린 설계. --q_uni 보다 우선 적용된다.)')
 ap.add_argument('--build_only', action='store_true', help='피처와 함수만 만들고 멈춤 (dgp_ic.py 가 불러다 쓸 때)')
 ap.add_argument('--shap', default='', help='SHAP 결과 저장 이름(접두어). 예: --shap shap_out → 그림·CSV 저장')
 A = ap.parse_args()
@@ -142,6 +161,17 @@ K = (TEST_D - PREV_D).days
 
 # 데이터가 07-10부터 있으므로, 과거 이력이 조금 쌓인 8일 뒤(07-18)부터 학습에 쓴다
 START = L.published_at.min().normalize() + 8 * DAY
+
+# 데이터 끝 = 실제로 view_5d 가 관측된 마지막 날(테스트 기준일). --label_measurable 에서
+#   "published_at + 5일 <= DATA_END 인 롱폼만 측정 완료" 판정에 쓴다. 이는 영상 단위의 고정 속성이라
+#   어떤 검증 fold 에서도 동일하게 D 이전 정보로 판정되므로 누수가 없다.
+DATA_END = TEST_D
+if A.label_measurable:
+    # 측정이 끝까지 가능한 롱폼만 라벨 계산(P·eligibility·Q)에 쓰기 위한 마스크. L 과 같은 인덱스.
+    _MEAS = (L.published_at + 5 * DAY) <= DATA_END
+    L_MEAS = L[_MEAS]
+else:
+    L_MEAS = L
 print(f'TEST_D={TEST_D.date()}  prev_label={PREV_D.date()} (D-{K})  F={F}  학습시작={START.date()}')
 
 
@@ -155,7 +185,8 @@ def past(d):
     """기준일 d의 '과거 점수' = d 이전 롱폼 view_5d 중앙값.
        채점 대상 조건(3편 이상 & 중앙값 100 이상)을 만족하는 채널만 돌려준다."""
     if d not in _PAST:
-        p = L[L.published_at < d].groupby('channel_id').view_5d.agg(['median', 'size'])
+        # [3차-1] --label_measurable 이면 측정 완료 롱폼(L_MEAS)만으로 P·eligibility 계산
+        p = L_MEAS[L_MEAS.published_at < d].groupby('channel_id').view_5d.agg(['median', 'size'])
         _PAST[d] = p[(p['size'] >= 3) & (p['median'] >= 100)]['median']
     return _PAST[d]
 
@@ -165,7 +196,8 @@ def partial_s(d, end):
        - end 가 그보다 이르면 → 미래 창의 '앞부분만 본' 부분 점수 (7번에서 사용)
        반환: pm(과거 점수), fm(미래 중앙값), fn(미래 영상 수), s(점수), rk(그날 채널들 중 s의 순위, 0~1)"""
     pm = past(d)
-    f = L[(L.published_at >= d) & (L.published_at < end)].groupby('channel_id').view_5d.agg(['median', 'size'])
+    # [3차-1] --label_measurable 이면 측정 완료 롱폼(L_MEAS)만으로 미래 점수 Q 계산
+    f = L_MEAS[(L_MEAS.published_at >= d) & (L_MEAS.published_at < end)].groupby('channel_id').view_5d.agg(['median', 'size'])
     o = pd.DataFrame({'pm': pm})
     o['fm'] = f['median'].reindex(o.index)            # 미래에 영상이 없는 채널은 NaN
     o['fn'] = f['size'].reindex(o.index).fillna(0)
@@ -185,6 +217,49 @@ def label(d, f):
         thr_idx = o.s.rank(ascending=False, method='first')   # 1 = 가장 큰 s (동점은 결정적 순서)
         return (thr_idx <= k).astype(int)
     return (o.s >= o.s.quantile(.8)).astype(int)
+
+
+# ── [3차-진단] --label_diag: 공식 라벨 vs 재구성 라벨 불일치 원인 분해 ────────────────────────
+#    공식 train_labels.csv 의 날짜(연습: 08-11, 08-25)마다, 같은 미래 창(prev_F)로 label() 을
+#    재구성해 채널별로 비교한다. 어떤 교정 플래그(--label_fix / --label_measurable)가 켜져 있느냐에
+#    따라 재구성 라벨이 달라지므로, 플래그 조합을 바꿔가며 불일치가 줄어드는지 확인하는 용도.
+#    학습/제출에는 전혀 영향이 없고, 출력 후 종료한다.
+if A.label_diag:
+    print('\n===== 라벨 정합성 진단 (--label_diag) =====')
+    print(f'설정: label_fix={A.label_fix}  label_measurable={A.label_measurable}  prev_F={A.prev_F}')
+    tot_elig_mis = tot_val_mis = tot_rows = 0
+    for dl in sorted(tl.Dl.unique()):
+        d = pd.Timestamp(dl)
+        off = tl[tl.Dl == dl].set_index('ch').target.astype(int)   # 공식 정답 (대상 채널만 들어 있음)
+        rec = label(d, A.prev_F)                                   # 재구성 라벨 (대상 채널 index)
+        off_ch = set(off.index)
+        rec_ch = set(rec.index)
+        both = off_ch & rec_ch
+        only_off = off_ch - rec_ch        # 공식은 대상인데 재구성은 비대상(eligibility 과소)
+        only_rec = rec_ch - off_ch        # 재구성은 대상인데 공식은 비대상(eligibility 과대)
+        # 둘 다 대상인 채널 중 라벨값이 다른 수
+        val_mis = sum(1 for c in both if int(off[c]) != int(rec[c]))
+        elig_mis = len(only_off) + len(only_rec)
+        # 측정 미완(published_at+5일 > 데이터 끝) 롱폼이 이 날 과거 창에 섞여 있는 채널 수(참고용)
+        past_seg = L[L.published_at < d]
+        unmeas = past_seg[(past_seg.published_at + 5 * DAY) > DATA_END]
+        n_ch_unmeas = unmeas.channel_id.nunique()
+        n = len(off_ch)
+        tot_rows += n
+        tot_elig_mis += elig_mis
+        tot_val_mis += val_mis
+        print(f'\n[{dl}] 공식 대상 {n}개')
+        print(f'  라벨값 불일치(둘 다 대상, 0/1 다름): {val_mis}  ({val_mis / max(n,1) * 100:.2f}%)')
+        print(f'  eligibility 불일치: {elig_mis}  (공식만 대상 {len(only_off)}, 재구성만 대상 {len(only_rec)})')
+        print(f'  참고: 과거 창에 측정 미완 롱폼이 섞인 채널 {n_ch_unmeas}개')
+    print(f'\n----- 합계 -----')
+    print(f'  총 공식 대상행 {tot_rows}  |  라벨값 불일치 {tot_val_mis}  |  eligibility 불일치 {tot_elig_mis}')
+    denom = max(tot_rows, 1)
+    print(f'  전체 불일치율 ≈ {(tot_val_mis + tot_elig_mis) / denom * 100:.2f}% '
+          f'(라벨값 {tot_val_mis / denom * 100:.2f}% + eligibility {tot_elig_mis / denom * 100:.2f}%)')
+    print('  → 교정 플래그 조합(--label_fix / --label_measurable)을 바꿔가며 이 수치가 줄어드는지 확인하라.')
+    import sys
+    sys.exit(0)
 
 
 # ═════════════════════════════════════════════════════════════════════════════════════
@@ -260,7 +335,8 @@ def _lag_obs_shape(dl, D):
          obs_exrise = 과거 중앙값 P 를 넘긴 관측 영상들의 평균 로그 초과폭 (초과 영상 없으면 0.0)
        관측 영상이 없으면 모두 NaN."""
     P = past(dl)
-    seg = L[(L.published_at >= dl) & (L.published_at < D)]
+    # [3차-1] --label_measurable 이면 측정 완료 롱폼(L_MEAS)만으로 관측-질 신호 계산(라벨 계산과 일관)
+    seg = L_MEAS[(L_MEAS.published_at >= dl) & (L_MEAS.published_at < D)]
     cols = ['conc', 'nrise'] + (['second', 'exrise'] if A.lag1feat2 else [])
     rows = {}
     for c, gg in seg.groupby('channel_id'):
@@ -503,7 +579,7 @@ def intervals(d, C):
     end = min(C, d + F * DAY)                         # 실제로 볼 수 있는 끝
     rem = (d + F * DAY - end).days                    # 아직 안 본 날 수
     vids = {c: np.sort(g.lv.values)
-            for c, g in L[(L.published_at >= d) & (L.published_at < end)].groupby('channel_id')}
+            for c, g in L_MEAS[(L_MEAS.published_at >= d) & (L_MEAS.published_at < end)].groupby('channel_id')}
     rate = RATE.get(d, {})
     out = {}
     for c in P.index:
@@ -591,12 +667,45 @@ def qmodel_uni(C):
         _QUNI[C] = LogisticRegression(C=1.0, max_iter=3000).fit(Z.drop(columns='y'), Z.y)
     return _QUNI[C]
 
+# [3차-2] 통합 q 모형 개편(--q_joint): kfrac(통합) + 관측-질 신호(--lag1q 의 q_conc/q_nrise/q_lag) +
+#   그 둘의 상호작용(kfrac × q_conc, kfrac × q_nrise)을 하나의 모형에 함께 넣는다.
+#   의도: "얼마나 봤는지(k/F)"와 "본 상승의 질"이 '함께' q 를 결정하게 한다. 적게 본 날(kfrac 작음)에는
+#   관측-질 신호를 더/덜 믿는 식의 조건부 작동을 상호작용이 담당한다. 단독 실패했던 q_uni/q_em 과 달리
+#   lag1q 신호와의 결합 시너지를 노린 설계. 관측-질 신호가 없으면(=lag1q 미사용) q_uni 와 동일하게 동작.
+def _q_joint_cols(Z):
+    """Z 에 kfrac 가 설정된 상태에서, 관측-질 신호와의 상호작용 열을 추가(제자리 수정)."""
+    if 'q_conc' in Z.columns:                         # --lag1q 로 주입된 관측-질 신호가 있을 때만
+        Z['kf_qconc'] = Z['kfrac'] * Z['q_conc']
+        Z['kf_qnrise'] = Z['kfrac'] * Z['q_nrise']
+    return Z
+
+_QJOINT = {}
+def qmodel_joint(C):
+    if C not in _QJOINT:
+        Zs = []
+        kset = range(3, F)
+        for d in pd.date_range(START, C - F * DAY):
+            for k in kset:
+                Z = qfeat(d, d + k * DAY)
+                Z['kfrac'] = k / F
+                _q_joint_cols(Z)
+                Z['y'] = label(d, F).reindex(Z.index)
+                Zs.append(Z)
+        Z = pd.concat(Zs).dropna()
+        _QJOINT[C] = LogisticRegression(C=1.0, max_iter=3000).fit(Z.drop(columns='y'), Z.y)
+    return _QJOINT[C]
+
 def q_predict(d, C):
     """소프트 라벨용 q = P(최종 정답=1 | [d,C) 관측). 통합/분리 모형 공통 진입점.
        반환: (Z 인덱스=channel_id 에 맞춘 q 배열, Z)"""
     k = (C - d).days
     Z = qfeat(d, C)
-    if A.q_uni:
+    if A.q_joint:                                     # [3차-2] 통합 개편 모형 우선
+        Zq = Z.copy()
+        Zq['kfrac'] = k / F
+        _q_joint_cols(Zq)
+        q = qmodel_joint(C).predict_proba(Zq)[:, 1]
+    elif A.q_uni:
         Zq = Z.copy()
         Zq['kfrac'] = k / F
         q = qmodel_uni(C).predict_proba(Zq)[:, 1]
