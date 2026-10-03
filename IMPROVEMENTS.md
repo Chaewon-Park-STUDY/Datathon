@@ -92,7 +92,91 @@ python run_final.py --data ./epoch_data --F 18 --prev_F 18 --mode latest --valid
 
 ---
 
-## 조합 평가 및 최종 제출
+# 2차 개선 플래그 (lag=1 오답 교정 심화)
+
+> 1차에서 **`--lag1feat` 만 유효**했다(검증 9일 평균 PR 0.5695→**0.5716**, 리더보드 0.7075→0.7090).
+> `--ap_weight`(하락), `--q_uni`/`--q_em`(중립)은 쓰지 않는다.
+> 2차는 "lag 창에서 이미 관측된 상승의 '질'을 구분한다"는 통한 방향을 더 깊게 판다.
+> 모두 **독립 플래그·기본 off**이며, **반드시 `--lag1feat` 와 함께** 평가한다(관측-질 신호를 재사용/보강하므로).
+>
+> **비교 기준(baseline for 2차)**: `--lag1feat` 켠 9일 평균 PR = **0.5716**. 이걸 넘겨야 2차 개선이 유효.
+> **채택 조건**: `--lag1feat` 위에 얹었을 때 9일 평균 PR > 0.5716 + 대부분의 날 개선 + 큰 하락 없음. KFold shuffle 금지.
+
+## ⚠️ 실행/검증 안내 (2차에도 동일)
+- 2차 코드도 작성 환경(pandas/numpy/scikit-learn/scipy 없음, 네트워크 차단)에서 **실행·검증하지 못했다.** `py_compile` 문법검증만 했다.
+- 모든 신규 피처는 **lag 창 중 D 이전 [prev_D, D) 관측부분만** 사용 → 누수 없음. 검증 수치로 최종 확인하라.
+- 아무 2차 플래그도 켜지 않으면 1차까지의 파이프라인이 그대로 재현된다(기본 off).
+
+## 2차-1 — 관측-질 피처 보강: `--lag1feat2`
+`--lag1feat` 의 `obs_conc`(상위영상 집중도) / `obs_nrise`(과거중앙값 초과 편수)에 더해,
+"일회성 1편 히트 vs 다편 고른 상승"을 더 잘 가르는 피처 2개를 메인 로지스틱에 추가한다
+(모두 `[prev_D, D)` 관측부분만 → 누수 없음, 날짜별 순위변환 후 `rk_obs_second`, `rk_obs_exrise`, MICE 보정):
+- `obs_second` = 관측 **2위/1위 조회수 비율** (1편뿐이면 0.0 = 극단 쏠림, 비슷한 2편 이상이면 1 근처 = 고른 상승)
+- `obs_exrise` = 과거 중앙값 P 를 **넘긴 관측 영상들의 평균 로그 초과폭** (초과 영상 없으면 0.0) — '얼마나 세게' 넘었나
+
+검증(반드시 `--lag1feat` 동반):
+```
+python run_final.py --data ./epoch_data --F 18 --prev_F 18 --mode latest --validate --lag1feat --lag1feat2
+```
+채택: 9일 평균 PR > 0.5716, 큰 하락 없음.
+
+## 2차-2 — q-모형에 관측-질 신호 주입: `--lag1q`
+소프트 라벨 q-모형(앞 k일만 본 정보 → 최종 정답 확률)은 지금 `obs_conc`/`obs_nrise` 신호를 쓰지 않는다.
+`--lag1q` 는 `qfeat()` 에 이 신호(날짜별 순위 `rk_obs_conc`/`rk_obs_nrise`)와 `lag`(7일 전 정답)을 추가한다
+(`X` 에서 날짜 d 기준으로 재사용 → `[prev_D, D)` 관측부분만, 누수 없음):
+- `q_conc` = `rk_obs_conc` (관측 집중도 순위), `q_nrise` = `rk_obs_nrise` (상승 편수 순위), `q_lag` = `lag`
+→ 잘린 날짜들의 소프트 라벨 q 추정 정확도 향상 기대. (`rk_obs_conc` 가 없으면, 즉 `--lag1feat` 를 안 켜면 자동 무시된다.)
+
+검증(반드시 `--lag1feat` 동반):
+```
+python run_final.py --data ./epoch_data --F 18 --prev_F 18 --mode latest --validate --lag1feat --lag1q
+```
+채택: 9일 평균 PR > 0.5716, 큰 하락 없음.
+
+## 2차-3 — lag=1 과잉예측 억제: `--lag1damp`
+상위권 오답의 **74%가 lag=1**(지난주 정답이었으나 이번엔 안 오른 채널, 평소 조회수 큼·최근 모멘텀 약함)이다.
+이를 직접 겨냥해, lag=1 이면서 관측 상승이 **"집중(1편 쏠림) + 소수 상승"일수록 커지는** 상호작용을 메인 모델에 추가한다:
+- `lag_weakobs` = `lag` × `rk_obs_conc` × `(1 − rk_obs_nrise)`
+  (lag=1 & 1편 쏠림 집중도 높음 & 상승 편수 적음 → 큰 값). lag 결측(채점 대상 아님)은 0 → 상호작용 0.
+→ 모델이 여기에 **음의 계수**를 학습하면, 믿을 만한 '다편 고른 상승' lag=1 은 두고 '일회성 상승' lag=1 만 깎아
+  lag=1 과잉예측을 줄인다(믿을 만한 양성은 보존).
+
+검증(반드시 `--lag1feat` 동반):
+```
+python run_final.py --data ./epoch_data --F 18 --prev_F 18 --mode latest --validate --lag1feat --lag1damp
+```
+채택: 9일 평균 PR > 0.5716, lag=1 많은 날의 하락이 없을 것.
+
+## 2차 조합 평가
+각 플래그를 `--lag1feat` 와 1:1 로 평가해 0.5716 을 넘긴 것만 조합한다. 조합도 `--validate` 재확인:
+```
+python run_final.py --data ./epoch_data --F 18 --prev_F 18 --mode latest --validate --lag1feat --lag1feat2 --lag1q --lag1damp
+```
+
+## 2차 최종 제출 (채택된 2차 플래그만, 반드시 `--F 26`, 2-모델 순위 반반 블렌딩)
+`a`(lb7627 계열, C=0.1) 와 `b`(latest 계열, C=0.015) 를 만든 뒤, **두 출력의 `rank(pct=True)` 평균**으로 블렌딩한다
+(1차에서 `pct` 누락으로 제출이 거부된 적 있으니 반드시 `pct=True` 범위 0~1 순위로 블렌딩할 것):
+```
+# [채택2차] = 1:1 검증을 통과한 2차 플래그들(예: --lag1feat --lag1damp). 두 명령에 동일하게 붙인다.
+python run_final.py --data ./epoch_data --F 26 --prev_F 18 --mode lb7627 --q_x --soft_k --lag1feat [채택2차] --out a.csv
+python run_final.py --data ./epoch_data --F 26 --prev_F 18 --mode latest             --lag1feat [채택2차] --out b.csv
+```
+블렌딩(파이썬):
+```python
+import pandas as pd
+a = pd.read_csv('a.csv'); b = pd.read_csv('b.csv')
+m = a.merge(b, on='row_id', suffixes=('_a', '_b'))
+# 반드시 pct=True (0~1 범위) 순위 평균
+m['prediction'] = 0.5 * m.prediction_a.rank(pct=True) + 0.5 * m.prediction_b.rank(pct=True)
+m[['row_id', 'prediction']].to_csv('submission_blend.csv', index=False)
+```
+
+> 주의: HANDOFF 5절 "효과 없던 것"(LightGBM/LambdaRank/survival/`--q_ext`/`--inter`/`--lag_int`/`--sim`/
+> 24·48h속도/구독자증가율 등) 과 1차에서 효과 없던 `--ap_weight`/`--q_uni`/`--q_em` 은 2차에서 쓰지 말 것.
+
+---
+
+## (1차) 조합 평가 및 최종 제출
 각 플래그를 단독으로 평가해 채택 기준을 넘긴 것만 조합한다. 조합도 반드시 `--validate` 로 재확인:
 ```
 # 예: 개선1 + 개선2 + ap_weight 가 각각 통과했다면 조합 검증
