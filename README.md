@@ -1,5 +1,6 @@
 # EPOCH 5th Datathon — Rising 예측 (본선, F=26)
 
+2026.10.3 19:00~ 10.4 05:00
 - 상세 맥락/결과/실패 목록: **HANDOFF_for_AI.md** 먼저 읽기
 - 현재 최종 후보: `FINAL8_F26_ens_half.csv` (LB 기준 0.7075 계열)
 - 데이터: `epoch_data/` (필수 컬럼만 남긴 축소본, 원본과 예측 동일 확인)
