@@ -118,6 +118,17 @@ ap.add_argument('--q_joint', action='store_true',
                      'kfrac×관측-질 상호작용을 함께 넣어 "얼마나 봤는지(k/F)"와 "본 상승의 질"이 결합해 q 를 결정하게 한다. '
                      '소프트 라벨 가중 w(--soft_k 의 관측비율)와 완전 호환. --lag1feat --lag1q 와 함께 켤 것. '
                      '(단독 실패했던 --q_uni/--q_em 과 달리 결합 시너지를 노린 설계. --q_uni 보다 우선 적용된다.)')
+# ── 4차 개선 플래그 (기본 off, 켜지 않으면 3차까지의 파이프라인이 그대로 재현된다) ──────────────
+#    통한 광맥(q-모형 + lag 창 관측신호)을 더 깊게. 반드시 --lag1feat --lag1q --q_joint 와 함께 평가.
+ap.add_argument('--lag1q2', action='store_true',
+                help='[4차-1] q-모형에 "관측 상승의 궤적/최신성" 신호를 소수만 더 주입한다(누수 없음, [d,end) 또는 D 이전만). '
+                     'qfeat 에 다음 2개를 추가: '
+                     'q_traj = 관측 구간 전반(앞 절반)의 순위 rk_half 대비 후반 전체 순위 rk 의 변화량(rk - rk_half; '
+                     '올라오는 중이면 +, 식는 중이면 −) — "지금 상승 궤적에 있는가"를 잘린 날에도 포착. '
+                     'q_recent = X 에서 날짜 d 기준 재사용하는 관측-질 신호 rk_last3_m(최근 3편 모멘텀 순위)와 '
+                     'na_m7(최근 7일 업로드 공백 지시)를 묶은 최신 업로드 활동도. '
+                     '--q_joint 와 함께 켜면 kfrac × q_traj 상호작용도 자동 추가되어 "얼마나 봤는지"와 "상승 궤적"이 결합한다. '
+                     'q_ext 전체(과거 하락 기록)를 켜지 말고 이 소수 신호만 쓸 것. 반드시 --lag1q(관측-질 신호 주입)와 함께.')
 ap.add_argument('--build_only', action='store_true', help='피처와 함수만 만들고 멈춤 (dgp_ic.py 가 불러다 쓸 때)')
 ap.add_argument('--shap', default='', help='SHAP 결과 저장 이름(접두어). 예: --shap shap_out → 그림·CSV 저장')
 A = ap.parse_args()
@@ -613,6 +624,15 @@ def qfeat(d, end):
         Z['q_conc'] = xr.rk_obs_conc.fillna(.5).values
         Z['q_nrise'] = xr.rk_obs_nrise.fillna(.5).values
         Z['q_lag'] = xr.lag.fillna(.2).values
+    if A.lag1q2:                                     # [4차-1] q 모형에 관측 상승의 궤적/최신성 신호 소수 주입
+        #   누수 없음: q_traj 는 [d,end) 관측부분만, q_recent 는 날짜 d 기준 X 피처(모두 D 이전) 재사용.
+        k = (end - d).days
+        oh = partial_s(d, d + max(k // 2, 1) * DAY)   # 관측 구간 '앞 절반'만 본 점수 (중간 시점 landmark)
+        rk_half = oh.rk.reindex(o.index).fillna(0).values
+        Z['q_traj'] = o.rk.values - rk_half          # 전반→후반 순위 변화량(올라오는 중이면 +, 식는 중이면 −)
+        xr2 = X[X.D == d].set_index('channel_id').reindex(Z.index)
+        # 최신 업로드 활동도: 최근 3편 모멘텀 순위(없으면 중립 .5) × 최근 7일 업로드가 있었는지(na_m7=1 이면 공백)
+        Z['q_recent'] = xr2.rk_last3_m.fillna(.5).values * (1.0 - xr2.na_m7.fillna(1.0).values)
     if A.q_ext:
         xr = X[X.D == d].set_index('channel_id').reindex(Z.index)
         for c in ['rk_cv_last10', 'rk_last3_m', 'rk_r7_n', 'rk_days_since', 'lagobs_rk']:   # 조건부 정보 확장
@@ -677,6 +697,9 @@ def _q_joint_cols(Z):
     if 'q_conc' in Z.columns:                         # --lag1q 로 주입된 관측-질 신호가 있을 때만
         Z['kf_qconc'] = Z['kfrac'] * Z['q_conc']
         Z['kf_qnrise'] = Z['kfrac'] * Z['q_nrise']
+    if 'q_traj' in Z.columns:                         # [4차-1] --lag1q2 의 상승 궤적 × 관측비율 상호작용
+        #   적게 본 날(kfrac 작음)엔 궤적을 조건부로 더/덜 믿도록 모델이 학습하게 한다.
+        Z['kf_qtraj'] = Z['kfrac'] * Z['q_traj']
     return Z
 
 _QJOINT = {}
