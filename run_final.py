@@ -79,6 +79,22 @@ ap.add_argument('--q_uni', action='store_true',
                      '모든 관측길이 k 의 예제를 한 번에 학습해 데이터 효율과 안정성을 높인다')
 ap.add_argument('--q_em', type=int, default=0,
                 help='[개선4] 완전 EM 반복 횟수. 최종 로지스틱 예측으로 소프트 라벨 q 를 갱신해 재학습한다(기본 0=안 함). 권장 1~2')
+# ── 2차 개선 플래그 (기본 off, 켜지 않으면 기존 파이프라인 그대로 재현. 모두 --lag1feat 와 함께 평가 권장) ──
+ap.add_argument('--lag1feat2', action='store_true',
+                help='[2차-1] lag 창 관측-질 피처 보강. --lag1feat 의 obs_conc/obs_nrise 에 더해 '
+                     '"일회성 1편 히트 vs 다편 고른 상승"을 더 잘 가르는 피처 2개를 메인 모델에 추가: '
+                     'obs_second(관측 2위/1위 조회수 비율; 1편뿐이면 0, 둘 이상 고르면 큼), '
+                     'obs_exrise(과거중앙값 P 초과 영상들의 평균 로그 초과폭; 초과 영상이 없으면 0). '
+                     '모두 [prev_D, D) 관측부분만 사용 → 누수 없음. --lag1feat 와 함께 켤 것(obs_conc/obs_nrise 재사용).')
+ap.add_argument('--lag1q', action='store_true',
+                help='[2차-2] q 모형(소프트 라벨 추정)에 lag 창 관측-질 신호를 주입. qfeat 에 '
+                     'obs_conc/obs_nrise 의 날짜별 순위와 lag(7일전 정답)을 추가해, 잘린 날짜들의 '
+                     '소프트 라벨 q 추정 정확도를 높인다. --lag1feat 와 함께 켤 것(관측-질 신호를 X 에서 재사용).')
+ap.add_argument('--lag1damp', action='store_true',
+                help='[2차-3] lag=1 과잉예측 억제. lag=1 이면서 관측 상승이 "집중(1편 쏠림)+소수 상승"일수록 '
+                     '커지는 상호작용 lag_weakobs = lag × rk_obs_conc × (1 − rk_obs_nrise) 를 메인 모델에 추가. '
+                     '상위권 오답의 74%가 lag=1 인 점을 직접 겨냥해, 믿을 만한 다편 고른 상승은 두고 '
+                     '일회성 상승만 깎도록 모델이 음의 계수를 학습하게 한다. --lag1feat 와 함께 켤 것.')
 ap.add_argument('--label_fix', action='store_true',
                 help='[개선1] 라벨 정합성 점검 옵션. 과거 점수 P 계산 시 view_5d 측정이 끝까지 가능한 '
                      '(published_at + 5일 <= 데이터 끝) 롱폼만 사용해, 측정이 덜 된 최근 영상이 '
@@ -234,14 +250,18 @@ def feats(D, extra=()):
 #    → "정답은 1인데 관측된 앞부분은 평범했다" = "뒷부분(09-01 이후)이 강했다"고 거꾸로 추론할 수 있다.
 # ═════════════════════════════════════════════════════════════════════════════════════
 def _lag_obs_shape(dl, D):
-    """[개선2] prev_label 창의 '이미 관측된' 부분 [dl, D) 에 올라온 롱폼으로,
+    """[개선2 / 2차-1] prev_label 창의 '이미 관측된' 부분 [dl, D) 에 올라온 롱폼으로,
        그 상승이 '일회성 1편 히트'인지 '여러 편 고른 상승'인지 구분하는 피처를 만든다.
        누수 없음: D 이전 데이터만 사용.
          obs_conc  = 관측 상위영상 집중도 = 최고 조회수 / 관측 영상 조회수 합 (1편뿐이면 1.0, 고르게면 낮음)
          obs_nrise = 과거 중앙값(P)을 넘긴 관측 영상 수 (여러 편이 고르게 올랐으면 큼)
-       관측 영상이 없으면 둘 다 NaN."""
+       --lag1feat2 면 2개 더 (일회성 vs 다편 고른 상승을 더 잘 가르는 피처):
+         obs_second = 관측 2위/1위 조회수 비율 (1편뿐이면 0.0, 둘 이상 고르게면 1 에 가까움)
+         obs_exrise = 과거 중앙값 P 를 넘긴 관측 영상들의 평균 로그 초과폭 (초과 영상 없으면 0.0)
+       관측 영상이 없으면 모두 NaN."""
     P = past(dl)
     seg = L[(L.published_at >= dl) & (L.published_at < D)]
+    cols = ['conc', 'nrise'] + (['second', 'exrise'] if A.lag1feat2 else [])
     rows = {}
     for c, gg in seg.groupby('channel_id'):
         if c not in P.index:
@@ -250,11 +270,20 @@ def _lag_obs_shape(dl, D):
         tot = vv.sum()
         conc = (vv.max() / tot) if tot > 0 else np.nan
         nrise = int((vv > P[c]).sum())               # 과거 중앙값을 넘긴 편수
-        rows[c] = (conc, nrise)
+        rec = [conc, nrise]
+        if A.lag1feat2:
+            sv = np.sort(vv)[::-1]                    # 조회수 내림차순
+            # 2위/1위 비율: 1편뿐이면 0(쏠림 극단), 비슷한 2편 이상이면 1 근처(다편 고른 상승)
+            second = (sv[1] / sv[0]) if (len(sv) >= 2 and sv[0] > 0) else 0.0
+            ex = np.log1p(vv) - np.log1p(P[c])        # 과거 중앙값 대비 로그 초과폭
+            ex = ex[ex > 0]                           # 실제로 넘은 영상만
+            exrise = float(ex.mean()) if ex.size > 0 else 0.0
+            rec += [second, exrise]
+        rows[c] = tuple(rec)
     if not rows:
-        return (pd.Series(dtype=float), pd.Series(dtype=float))
-    df = pd.DataFrame(rows, index=['conc', 'nrise']).T
-    return df['conc'], df['nrise']
+        return tuple(pd.Series(dtype=float) for _ in cols)
+    df = pd.DataFrame(rows, index=cols).T
+    return tuple(df[c] for c in cols)
 
 def add_lag(X):
     out = []
@@ -265,9 +294,14 @@ def add_lag(X):
                'lag': g.channel_id.map(lab).values,        # 7일 전 정답 (0/1, 대상 아니었으면 NaN)
                'lagobs_rk': g.channel_id.map(o.rk).values}  # 관측된 앞부분의 순위 (0~1)
         if A.lag1feat:
-            conc, nrise = _lag_obs_shape(D - K * DAY, D)
+            vals = _lag_obs_shape(D - K * DAY, D)
+            conc, nrise = vals[0], vals[1]
             rec['obs_conc'] = g.channel_id.map(conc).values
             rec['obs_nrise'] = g.channel_id.map(nrise).values
+            if A.lag1feat2:                           # [2차-1] 보강 피처 2개
+                second, exrise = vals[2], vals[3]
+                rec['obs_second'] = g.channel_id.map(second).values
+                rec['obs_exrise'] = g.channel_id.map(exrise).values
         out.append(pd.DataFrame(rec))
     X = X.merge(pd.concat(out), on=['channel_id', 'D'], how='left')
 
@@ -376,7 +410,12 @@ NUM = ['past_med', 'past_std', 'cv_last10', 'm7', 'm3', 'last3_m', 'last_m', 'sl
 
 # (1) 날짜별 백분위 순위: 정답이 '그날 상위 20%'라는 상대 기준이라,
 #     피처도 '그날 다른 채널들 사이에서 몇 등인지'로 바꾸면 날짜마다 기준이 흔들리지 않는다. (결측은 결측으로 남음)
-for c in NUM + ['struct_p'] + (['sim_p'] if A.sim else []) + (['obs_conc', 'obs_nrise'] if A.lag1feat else []):
+_RK_EXTRA = []
+if A.lag1feat:
+    _RK_EXTRA += ['obs_conc', 'obs_nrise']
+    if A.lag1feat2:
+        _RK_EXTRA += ['obs_second', 'obs_exrise']
+for c in NUM + ['struct_p'] + (['sim_p'] if A.sim else []) + _RK_EXTRA:
     X['rk_' + c] = X.groupby('D')[c].rank(pct=True)
 
 # (2) 결측 지시변수: 값이 비어 있었으면 1. "최근에 영상이 없었다" 같은 사실 자체가 정보다
@@ -387,6 +426,15 @@ for c in IND:
 MAIN = ['rk_' + c for c in NUM] + ['lag']
 if A.lag1feat:   # [개선2] lag=1 오답 교정: 관측 상승의 집중도/상승 편수를 메인 모델에 추가
     MAIN = MAIN + ['rk_obs_conc', 'rk_obs_nrise']
+    if A.lag1feat2:   # [2차-1] 관측-질 보강 피처 2개
+        MAIN = MAIN + ['rk_obs_second', 'rk_obs_exrise']
+    if A.lag1damp:   # [2차-3] lag=1 과잉예측 억제 상호작용 (lag=1 & 쏠린/소수 상승일수록 큼)
+        #   rk_obs_conc(집중도 순위, 1편 쏠림=큼), (1-rk_obs_nrise)(상승 편수 적을수록 큼) 곱.
+        #   lag 결측(채점 대상 아님)은 0 으로 봐 상호작용 0. 관측-질 결측은 중앙값 0.5 로 둬 중립.
+        X['lag_weakobs'] = (X.lag.fillna(0)
+                            * X.rk_obs_conc.fillna(.5)
+                            * (1 - X.rk_obs_nrise.fillna(.5)))
+        MAIN = MAIN + ['lag_weakobs']
 if A.lag_int:   # lag=1 이어도 덩치가 크거나 최근이 약하면 덜 믿도록
     X['lag_pm'] = X.lag.fillna(0) * X.rk_past_med
     X['lag_l3'] = X.lag.fillna(0) * X.rk_last3_m             # MICE 로 채울 열
@@ -482,6 +530,13 @@ def qfeat(d, end):
         Z['x_up'] = xr.rk_upl_rate.fillna(.5).values
         Z['x_lag'] = xr.lag.fillna(.2).values
         Z['x_nalag'] = xr.lag.isna().astype(float).values
+    if A.lag1q and ('rk_obs_conc' in X.columns):      # [2차-2] q 모형에 lag 창 관측-질 신호 주입
+        #   obs_conc/obs_nrise 의 날짜별 순위 + lag → 잘린 날짜의 소프트 라벨 q 추정 정확도 향상.
+        #   누수 없음: 모두 D 이전 [prev_D, D) 관측부분만으로 X 에서 계산된 값(날짜 d 기준).
+        xr = X[X.D == d].set_index('channel_id').reindex(Z.index)
+        Z['q_conc'] = xr.rk_obs_conc.fillna(.5).values
+        Z['q_nrise'] = xr.rk_obs_nrise.fillna(.5).values
+        Z['q_lag'] = xr.lag.fillna(.2).values
     if A.q_ext:
         xr = X[X.D == d].set_index('channel_id').reindex(Z.index)
         for c in ['rk_cv_last10', 'rk_last3_m', 'rk_r7_n', 'rk_days_since', 'lagobs_rk']:   # 조건부 정보 확장
