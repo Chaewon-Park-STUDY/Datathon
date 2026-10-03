@@ -291,3 +291,137 @@ m[['row_id', 'prediction']].to_csv('submission_blend.csv', index=False)
 
 > 주의: HANDOFF 5절 "효과 없던 것"(LightGBM/LambdaRank/survival/`--q_ext`/`--inter`/`--lag_int`/`--sim`/
 > 24·48h속도/구독자증가율 등)과 1차에서 효과 없던 `--ap_weight`/`--q_uni`/`--q_em`(단독)·2차 `--lag1feat2`/`--lag1damp`(하락)는 3차에서 쓰지 말 것.
+
+---
+
+# 4차 개선 플래그 (q-모형 + 관측신호 심화)
+
+> 지금까지 통한 것: **`--lag1feat`(리더보드 0.7090)**, **`--lag1q`(0.7114)**, **`--q_joint`**.
+> **현재 최고 조합 = `--lag1feat --lag1q --q_joint`**(18일 창 9일 평균 PR = **0.5743**, 리더보드 **0.7115**).
+> 통한 광맥은 **"q-모형(소프트 라벨) + lag 창 관측-질 신호"** 한 줄기다. 4차는 이 광맥을 더 깊게 파되,
+> 모델 구조(로지스틱 + 순위변환 + 소프트 라벨)는 그대로 유지하고 이미 실패한 모델교체/손실변경/라벨교정류는 반복하지 않는다.
+>
+> 모두 **독립 플래그·기본 off**다. **아무 4차 플래그도 켜지 않으면 3차까지의 파이프라인이 그대로 재현된다.**
+> 성능용 4차 플래그(`--lag1q2`)는 **반드시 `--lag1feat --lag1q --q_joint` 와 함께** 평가한다.
+>
+> **비교 기준(baseline for 4차)**: `--lag1feat --lag1q --q_joint` 9일 평균 PR = **0.5743**(현재 최고 조합). 이걸 넘겨야 4차가 유효.
+> **채택 조건**: 그 위에 얹었을 때 9일 평균 PR > **0.5743** + 대부분의 날 개선 + 큰 하락 없음. KFold shuffle 금지.
+> (검증 +0.009 ≈ 리더보드 +0.002 로 축소 반영된다.)
+
+## ⚠️ 실행/검증 안내 (4차에도 동일 — 작성 환경에서 실행 불가)
+- 4차 코드도 작성 환경(pandas/numpy/scikit-learn/scipy 없음, 네트워크 차단으로 pip/uv 불가)에서 **실행·검증하지 못했다.** `py_compile` 문법검증만 했다.
+- 모든 신규 신호는 **[d, end) 관측구간 또는 D 이전** 정보만 사용 → 누수 없음. **미래(end 이후)를 절대 참조하지 않는다.**
+- **반드시 로컬(pandas 설치, numpy<2)에서 아래 명령으로 수치 확인하라.** 기존 라이브러리만 쓰며 새 의존성은 없다.
+
+## 먼저: 현재 최고 조합의 기준 검증(비교 기준 0.5743 재확인)
+```
+python run_final.py --data ./epoch_data --F 18 --prev_F 18 --mode latest --validate --lag1feat --lag1q --q_joint
+# → "평균 ... PR 0.5743" 근처가 나와야 함 (4차는 이 수치를 넘겨야 유효)
+```
+
+## 4차-1 — q-모형에 관측 상승의 '궤적/최신성' 신호 주입: `--lag1q2`
+`--lag1q` 가 통한 방향(q-모형에 관측-질 신호 주입)을 **소수의 신호로** 더 판다. `qfeat()` 에 다음 2개를 추가하되,
+**잘린(미래 창이 데이터 끝에서 잘린) 날짜에서도 유효**하도록 `[d, end)` 관측구간 또는 D 이전 정보만 쓴다(누수 없음):
+- `q_traj` = **관측 상승의 궤적**. 관측 구간을 **앞 절반**만 본 순위 `rk_half` 대비, 관측 구간 **전체**를 본 순위 `rk` 의
+  변화량(`rk − rk_half`). 올라오는 중이면 +, 식는 중이면 −. "지금 상승 궤적에 있는가"를 잘린 날에도 포착한다.
+  (`--q_ext` 에 유사 로직이 있으나 `--q_ext` 전체는 과거 하락 기록이므로 켜지 말고 이 **단일 신호만** 쓴다.)
+- `q_recent` = **최신 업로드 활동도**. X 에서 날짜 d 기준 재사용하는 `rk_last3_m`(최근 3편 모멘텀 순위, 없으면 중립 0.5)에
+  `na_m7`(최근 7일 업로드 공백 지시; 공백이면 1)을 곱으로 반영 → 최근에 활발히 올리면서 모멘텀이 좋을수록 큼.
+
+`--q_joint` 와 함께 켜면 통합 q-모형에 **`kfrac × q_traj` 상호작용**이 자동 추가되어, "얼마나 봤는지(k/F)"와 "상승 궤적"이
+결합해 q 를 결정한다(적게 본 날엔 궤적을 조건부로 더/덜 믿도록 모델이 학습). `--lag1q` 를 켜지 않아도 동작하지만,
+관측-질 신호와의 결합 시너지를 노린 설계이므로 **반드시 `--lag1q` 와 함께** 켠다.
+
+검증(반드시 `--lag1feat --lag1q --q_joint` 동반):
+```
+python run_final.py --data ./epoch_data --F 18 --prev_F 18 --mode latest --validate --lag1feat --lag1q --q_joint --lag1q2
+```
+채택: 9일 평균 PR > **0.5743**, 큰 하락 없음.
+
+## 4차-2 — q_joint + EM 결합 검증: `--q_joint --q_em 1` (새 플래그 불필요)
+`--q_joint`(통합 q-모형)와 `--q_em N`(완전 EM)은 **이미 코드상 공존**한다(별도 보정·새 플래그 불필요). 흐름:
+1. `train_set` 이 `q_predict` → **`qmodel_joint`**(통합 q-모형)로 소프트 라벨 초기 q 를 만든다.
+2. 그 위에서 `fit_predict_em` 이 **메인 로지스틱 예측으로 소프트 라벨 가중 `w` 를 N회 갱신**(EM)한다.
+   즉 통합 q-모형이 만든 q 를 EM 이 메인 모델 신호로 다듬는다. `_sk`(관측비율)와도 호환.
+> 과거 `--q_em` **단독**은 중립이었으나, 통합 q-모형(q_joint) 위에서의 결합은 **아직 미검증**이다. 아래로 확인한다
+> (반복이 많을수록 느리고 과적합 위험 → **`--q_em 1` 부터**).
+```
+python run_final.py --data ./epoch_data --F 18 --prev_F 18 --mode latest --validate --lag1feat --lag1q --q_joint --q_em 1
+# lag1q2 까지 얹어서도 비교
+python run_final.py --data ./epoch_data --F 18 --prev_F 18 --mode latest --validate --lag1feat --lag1q --q_joint --lag1q2 --q_em 1
+```
+채택: 9일 평균 PR > **0.5743**, 큰 하락 없음. (중립/하락이면 `--q_em` 은 쓰지 않는다.)
+
+## 4차 조합 평가
+각 4차 후보를 `--lag1feat --lag1q --q_joint` 위에 1:1 로 평가해 **0.5743** 을 넘긴 것만 조합한다. 조합도 `--validate` 재확인:
+```
+python run_final.py --data ./epoch_data --F 18 --prev_F 18 --mode latest --validate --lag1feat --lag1q --q_joint --lag1q2
+# (q_em 결합이 통과했다면)
+python run_final.py --data ./epoch_data --F 18 --prev_F 18 --mode latest --validate --lag1feat --lag1q --q_joint --lag1q2 --q_em 1
+```
+
+## 4차-3 — 블렌딩 비율 탐색 (코드 변경 없음, 리더보드 제출로만 확인)
+현재 최종은 두 모델 출력 `a`(lb7627 계열, C=0.1)·`b`(latest 계열, C=0.015)의 `rank(pct=True)` **반반(0.5:0.5)** 평균이다.
+비율은 **시간검증으로 못 재므로**(검증은 단일 모델 1개만 돈다) **리더보드 제출로만** 확인한다. 하루 제출 횟수가 한정되니
+**소수 비율만** 시험하라(예: `w = 0.3, 0.4, 0.6, 0.7`). `a.csv`/`b.csv` 를 **한 번만 생성**한 뒤, 아래 스니펫으로
+여러 비율의 블렌딩 파일을 만들어 각각 제출해 비교한다(반드시 `pct=True`, 과거 `pct` 누락으로 제출 거부된 적 있음):
+```python
+import pandas as pd
+a = pd.read_csv('a.csv'); b = pd.read_csv('b.csv')
+m = a.merge(b, on='row_id', suffixes=('_a', '_b'))
+ra = m.prediction_a.rank(pct=True)      # 반드시 pct=True (0~1 범위)
+rb = m.prediction_b.rank(pct=True)
+for w in (0.3, 0.4, 0.5, 0.6, 0.7):     # a 가중 w, b 가중 (1-w). 소수만 시험
+    m['prediction'] = w * ra + (1 - w) * rb
+    m[['row_id', 'prediction']].to_csv(f'submission_blend_a{int(w*100)}.csv', index=False)
+    print('saved submission_blend_a%d.csv' % int(w * 100))
+# 0.5:0.5(submission_blend_a50.csv)가 현재 최종. 양옆 비율을 제출해 리더보드가 오르는 쪽을 채택.
+```
+> 비율 탐색은 **채택된 4차 플래그로 생성한 `a.csv`/`b.csv`** 위에서 하라(아래 최종 제출 명령 참고).
+
+## 4차-4 — 규제 C 재탐색 (코드 변경 없음, `--C` 인자 이용)
+피처가 늘면(4차 신호 추가) 최적 규제 `C` 가 달라졌을 수 있다. `--C` 는 이미 인자로 존재한다
+(기본: lb7627=0.1, latest=0.015). 각 모델별로 **기본값 주변**을 `--validate` 로 쓸어보고,
+현재 최고 조합 대비 9일 평균 PR 이 오르는 값만 채택한다(두 모델을 **따로** 탐색).
+
+latest 모델(C 기본 0.015) 주변 — 검증 명령:
+```
+python run_final.py --data ./epoch_data --F 18 --prev_F 18 --mode latest --validate --lag1feat --lag1q --q_joint --C 0.008
+python run_final.py --data ./epoch_data --F 18 --prev_F 18 --mode latest --validate --lag1feat --lag1q --q_joint --C 0.015
+python run_final.py --data ./epoch_data --F 18 --prev_F 18 --mode latest --validate --lag1feat --lag1q --q_joint --C 0.025
+python run_final.py --data ./epoch_data --F 18 --prev_F 18 --mode latest --validate --lag1feat --lag1q --q_joint --C 0.04
+python run_final.py --data ./epoch_data --F 18 --prev_F 18 --mode latest --validate --lag1feat --lag1q --q_joint --C 0.06
+```
+lb7627 모델(C 기본 0.1) 주변 — 검증 명령(이 계열은 `--q_x --soft_k` 를 쓴다):
+```
+python run_final.py --data ./epoch_data --F 18 --prev_F 18 --mode lb7627 --q_x --soft_k --validate --lag1feat --lag1q --q_joint --C 0.05
+python run_final.py --data ./epoch_data --F 18 --prev_F 18 --mode lb7627 --q_x --soft_k --validate --lag1feat --lag1q --q_joint --C 0.1
+python run_final.py --data ./epoch_data --F 18 --prev_F 18 --mode lb7627 --q_x --soft_k --validate --lag1feat --lag1q --q_joint --C 0.2
+python run_final.py --data ./epoch_data --F 18 --prev_F 18 --mode lb7627 --q_x --soft_k --validate --lag1feat --lag1q --q_joint --C 0.3
+```
+> `--validate` 는 단일 모델 1개의 9일 평균 PR 만 낸다(블렌딩은 안 함). 각 모델에서 가장 높은 C 를 고른 뒤,
+> 그 C 를 최종 제출 명령의 해당 모델에 `--C` 로 지정해 쓴다. 큰 하락이 없고 소폭이라도 오르는 값만 채택.
+
+## 4차 최종 제출 (채택된 4차 플래그만, 반드시 `--F 26`, 2-모델 순위 반반 블렌딩, `pct=True` 필수)
+`a`(lb7627 계열) 와 `b`(latest 계열) 를 만든 뒤, **두 출력의 `rank(pct=True)` 평균(0~1 범위)**으로 블렌딩한다
+(과거 `pct` 누락으로 제출이 거부된 적 있으니 **반드시 `pct=True`**):
+```
+# [채택4차] = 1:1 검증(0.5743 초과)을 통과한 4차 플래그들(예: --lag1q2, 통과 시 --q_em 1). 두 명령에 동일하게 붙인다.
+# C 재탐색(4차-4)에서 더 좋은 값을 찾았으면 각 모델에 --C 로 지정(아래는 기본값 예시).
+python run_final.py --data ./epoch_data --F 26 --prev_F 18 --mode lb7627 --q_x --soft_k --lag1feat --lag1q --q_joint [채택4차] --out a.csv
+python run_final.py --data ./epoch_data --F 26 --prev_F 18 --mode latest             --lag1feat --lag1q --q_joint [채택4차] --out b.csv
+```
+블렌딩(파이썬, 기본 0.5:0.5 — 비율 탐색은 4차-3 스니펫 사용):
+```python
+import pandas as pd
+a = pd.read_csv('a.csv'); b = pd.read_csv('b.csv')
+m = a.merge(b, on='row_id', suffixes=('_a', '_b'))
+# 반드시 pct=True (0~1 범위) 순위 평균 — pct 누락 시 제출 거부됨
+m['prediction'] = 0.5 * m.prediction_a.rank(pct=True) + 0.5 * m.prediction_b.rank(pct=True)
+m[['row_id', 'prediction']].to_csv('submission_blend.csv', index=False)
+```
+
+> 주의: HANDOFF 5절 "효과 없던 것"(LightGBM/LambdaRank/survival/`--q_ext`(전체)/`--inter`/`--lag_int`/`--sim`/
+> 24·48h속도/구독자증가율 등), 1차 `--ap_weight`/`--q_uni`/`--q_em`(단독), 2차 `--lag1feat2`/`--lag1damp`(하락),
+> 그리고 라벨교정류(`--label_fix`/`--label_measurable` 가 3차에서 미채택이었다면)는 4차에서 반복하지 말 것.
+> 4차는 **q-모형+관측신호(`--lag1q2`)와 q_joint+EM 결합·블렌딩비율·C 재탐색**에만 집중한다.
