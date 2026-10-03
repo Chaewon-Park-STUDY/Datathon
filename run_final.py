@@ -67,6 +67,22 @@ ap.add_argument('--inter', default='none', choices=['none', 'pm', 'l3', 'both'],
 ap.add_argument('--lag_mode', default='full', choices=['full', 'partial', 'na'],
                 help='학습 행의 lag 창이 데이터 끝을 넘을 때: full=끝까지 계산(기존), partial=데이터 끝까지만, na=결측 처리')
 ap.add_argument('--soft_k', action='store_true', help='소프트 라벨 가중치에 (관측일수/F) 곱하기')
+# ── 신규 개선 플래그 (기본 off, 켜지 않으면 기존 0.7075 파이프라인 그대로 재현) ──────────────
+ap.add_argument('--lag1feat', action='store_true',
+                help='[개선2] lag 창에서 이미 관측된 상승이 "일회성 1편 히트"인지 "여러 편 고른 상승"인지 '
+                     '구분하는 피처 2개(관측 상위영상 집중도 obs_conc, 상승 영상 수 obs_nrise)를 메인 모델에 추가')
+ap.add_argument('--ap_weight', type=float, default=1.0,
+                help='[개선3] AP 직접 최적화용 양성 가중. 하드 라벨 양성(y=1,w=1) 행의 sample_weight 를 '
+                     '이 값만큼 추가로 곱한다(기본 1.0 = 변화 없음). 소프트 라벨 가중 w 와 곱셈 호환 유지. 권장 1.5~3.0')
+ap.add_argument('--q_uni', action='store_true',
+                help='[개선4] q 모형을 k 별 분리 대신 k/F 를 입력 피처로 넣은 통합 q 모형으로 학습(피처 소수). '
+                     '모든 관측길이 k 의 예제를 한 번에 학습해 데이터 효율과 안정성을 높인다')
+ap.add_argument('--q_em', type=int, default=0,
+                help='[개선4] 완전 EM 반복 횟수. 최종 로지스틱 예측으로 소프트 라벨 q 를 갱신해 재학습한다(기본 0=안 함). 권장 1~2')
+ap.add_argument('--label_fix', action='store_true',
+                help='[개선1] 라벨 정합성 점검 옵션. 과거 점수 P 계산 시 view_5d 측정이 끝까지 가능한 '
+                     '(published_at + 5일 <= 데이터 끝) 롱폼만 사용해, 측정이 덜 된 최근 영상이 '
+                     'eligibility/과거중앙값을 흔드는 것을 줄인다. 공식 08-11 라벨과의 1.5% 불일치 원인 점검용')
 ap.add_argument('--build_only', action='store_true', help='피처와 함수만 만들고 멈춤 (dgp_ic.py 가 불러다 쓸 때)')
 ap.add_argument('--shap', default='', help='SHAP 결과 저장 이름(접두어). 예: --shap shap_out → 그림·CSV 저장')
 A = ap.parse_args()
@@ -144,6 +160,14 @@ def partial_s(d, end):
 def label(d, f):
     """기준일 d, 미래 창 f일의 정답: s 상위 20% = 1"""
     o = partial_s(d, d + f * DAY)
+    if A.label_fix:
+        # [개선1] 상위 20% 를 분위수 임계 비교(동점 포함) 대신 '순위 기준 정확히 상위 20%'로 선정.
+        #   quantile(.8) 비교는 임계값에 동점이 몰리면 20% 보다 많거나 적게 1 을 줄 수 있어
+        #   공식 라벨과 미세하게 어긋난다. 가장 큰 s 부터 ceil(0.2*n) 개만 1 로 둔다(결정적, 누수 없음).
+        n = o.s.notna().sum()
+        k = int(np.ceil(0.2 * n))
+        thr_idx = o.s.rank(ascending=False, method='first')   # 1 = 가장 큰 s (동점은 결정적 순서)
+        return (thr_idx <= k).astype(int)
     return (o.s >= o.s.quantile(.8)).astype(int)
 
 
@@ -209,14 +233,42 @@ def feats(D, extra=()):
 #    또 08-25 ~ 08-31 영상은 우리 데이터에 이미 있다(관측된 구간).
 #    → "정답은 1인데 관측된 앞부분은 평범했다" = "뒷부분(09-01 이후)이 강했다"고 거꾸로 추론할 수 있다.
 # ═════════════════════════════════════════════════════════════════════════════════════
+def _lag_obs_shape(dl, D):
+    """[개선2] prev_label 창의 '이미 관측된' 부분 [dl, D) 에 올라온 롱폼으로,
+       그 상승이 '일회성 1편 히트'인지 '여러 편 고른 상승'인지 구분하는 피처를 만든다.
+       누수 없음: D 이전 데이터만 사용.
+         obs_conc  = 관측 상위영상 집중도 = 최고 조회수 / 관측 영상 조회수 합 (1편뿐이면 1.0, 고르게면 낮음)
+         obs_nrise = 과거 중앙값(P)을 넘긴 관측 영상 수 (여러 편이 고르게 올랐으면 큼)
+       관측 영상이 없으면 둘 다 NaN."""
+    P = past(dl)
+    seg = L[(L.published_at >= dl) & (L.published_at < D)]
+    rows = {}
+    for c, gg in seg.groupby('channel_id'):
+        if c not in P.index:
+            continue
+        vv = gg.view_5d.values.astype(float)
+        tot = vv.sum()
+        conc = (vv.max() / tot) if tot > 0 else np.nan
+        nrise = int((vv > P[c]).sum())               # 과거 중앙값을 넘긴 편수
+        rows[c] = (conc, nrise)
+    if not rows:
+        return (pd.Series(dtype=float), pd.Series(dtype=float))
+    df = pd.DataFrame(rows, index=['conc', 'nrise']).T
+    return df['conc'], df['nrise']
+
 def add_lag(X):
     out = []
     for D, g in X.groupby('D'):
         lab = label(D - K * DAY, A.prev_F)           # 학습용: K일 전 기준일의 정답 (직접 만든 라벨)
         o = partial_s(D - K * DAY, D)                 # 그 정답의 미래 창 중 D 이전(이미 관측된) 부분만 본 점수
-        out.append(pd.DataFrame({'channel_id': g.channel_id, 'D': D,
-                                 'lag': g.channel_id.map(lab).values,        # 7일 전 정답 (0/1, 대상 아니었으면 NaN)
-                                 'lagobs_rk': g.channel_id.map(o.rk).values}))  # 관측된 앞부분의 순위 (0~1)
+        rec = {'channel_id': g.channel_id, 'D': D,
+               'lag': g.channel_id.map(lab).values,        # 7일 전 정답 (0/1, 대상 아니었으면 NaN)
+               'lagobs_rk': g.channel_id.map(o.rk).values}  # 관측된 앞부분의 순위 (0~1)
+        if A.lag1feat:
+            conc, nrise = _lag_obs_shape(D - K * DAY, D)
+            rec['obs_conc'] = g.channel_id.map(conc).values
+            rec['obs_nrise'] = g.channel_id.map(nrise).values
+        out.append(pd.DataFrame(rec))
     X = X.merge(pd.concat(out), on=['channel_id', 'D'], how='left')
 
     # 테스트 날짜에는 직접 만든 라벨 대신 공식 정답(08-25)을 넣는다
@@ -324,7 +376,7 @@ NUM = ['past_med', 'past_std', 'cv_last10', 'm7', 'm3', 'last3_m', 'last_m', 'sl
 
 # (1) 날짜별 백분위 순위: 정답이 '그날 상위 20%'라는 상대 기준이라,
 #     피처도 '그날 다른 채널들 사이에서 몇 등인지'로 바꾸면 날짜마다 기준이 흔들리지 않는다. (결측은 결측으로 남음)
-for c in NUM + ['struct_p'] + (['sim_p'] if A.sim else []):
+for c in NUM + ['struct_p'] + (['sim_p'] if A.sim else []) + (['obs_conc', 'obs_nrise'] if A.lag1feat else []):
     X['rk_' + c] = X.groupby('D')[c].rank(pct=True)
 
 # (2) 결측 지시변수: 값이 비어 있었으면 1. "최근에 영상이 없었다" 같은 사실 자체가 정보다
@@ -333,6 +385,8 @@ for c in IND:
     X['na_' + c] = X[c].isna().astype(float)
 
 MAIN = ['rk_' + c for c in NUM] + ['lag']
+if A.lag1feat:   # [개선2] lag=1 오답 교정: 관측 상승의 집중도/상승 편수를 메인 모델에 추가
+    MAIN = MAIN + ['rk_obs_conc', 'rk_obs_nrise']
 if A.lag_int:   # lag=1 이어도 덩치가 크거나 최근이 약하면 덜 믿도록
     X['lag_pm'] = X.lag.fillna(0) * X.rk_past_med
     X['lag_l3'] = X.lag.fillna(0) * X.rk_last3_m             # MICE 로 채울 열
@@ -465,6 +519,36 @@ def qmodel(k, C):
         _Q[(k, C)] = LogisticRegression(C=1.0, max_iter=2000).fit(Z.drop(columns='y'), Z.y)
     return _Q[(k, C)]
 
+# [개선4] 통합 q 모형: k 별 분리 대신 k/F(kfrac) 를 입력 피처로 넣어, 모든 관측길이 k 의 예제를
+#   한 번에 학습한다. 학습 예제가 많아져(피처 소수) 추정이 안정적이고 짧은 k 에서도 정보 공유.
+_QUNI = {}
+def qmodel_uni(C):
+    if C not in _QUNI:
+        Zs = []
+        kset = range(3, F)                            # 소프트 라벨에서 쓰는 관측길이 범위(3일~F-1일)
+        for d in pd.date_range(START, C - F * DAY):
+            for k in kset:
+                Z = qfeat(d, d + k * DAY)
+                Z['kfrac'] = k / F                    # 관측 비율 (통합 모형의 핵심 입력)
+                Z['y'] = label(d, F).reindex(Z.index)
+                Zs.append(Z)
+        Z = pd.concat(Zs).dropna()
+        _QUNI[C] = LogisticRegression(C=1.0, max_iter=3000).fit(Z.drop(columns='y'), Z.y)
+    return _QUNI[C]
+
+def q_predict(d, C):
+    """소프트 라벨용 q = P(최종 정답=1 | [d,C) 관측). 통합/분리 모형 공통 진입점.
+       반환: (Z 인덱스=channel_id 에 맞춘 q 배열, Z)"""
+    k = (C - d).days
+    Z = qfeat(d, C)
+    if A.q_uni:
+        Zq = Z.copy()
+        Zq['kfrac'] = k / F
+        q = qmodel_uni(C).predict_proba(Zq)[:, 1]
+    else:
+        q = qmodel(k, C).predict_proba(Z)[:, 1]
+    return q, Z
+
 def train_set(C):
     """데이터 끝이 C 일 때의 학습 데이터 = 하드 라벨 행 + 소프트 라벨 행. 열 w 가 가중치."""
     rows = []
@@ -475,10 +559,10 @@ def train_set(C):
         rows.append(r[r.y.notna()].assign(w=1.))
     # (b) 정답이 잘린 날 (최소 3일은 관측된 날까지): 두 줄로 복제
     for d in pd.date_range(C - (F - 1) * DAY, C - 3 * DAY):
-        Z = qfeat(d, C)                               # 지금까지 본 만큼의 정보
-        q = qmodel((C - d).days, C).predict_proba(Z)[:, 1]   # 최종 정답이 1일 확률
+        q, Z = q_predict(d, C)                        # 최종 정답이 1일 확률 (통합/분리 모형)
         r = X[X.D == d].set_index('channel_id').loc[Z.index].reset_index()
         sk = (C - d).days / F if A.soft_k else 1.0    # (옵션) 적게 관측된 날일수록 덜 믿기
+        r['_sk'] = sk                                 # EM 재가중용으로 관측비율 보관
         rows += [r.assign(y=1, w=q * sk),             # "1일 수도 있다" — 가중치 q
                  r.assign(y=0, w=(1 - q) * sk)]       # "0일 수도 있다" — 가중치 1-q
     out = pd.concat(rows, ignore_index=True)
@@ -511,11 +595,42 @@ def fit_predict(tr, te):
     a, b = design(tr, te)                             # 6번 결측 처리
     # 최근 날짜일수록 크게 반영: 7일 전 행은 가중치 절반, 14일 전은 1/4 ... (× 소프트 라벨 가중치 w)
     sw = tr.w.values * 0.5 ** ((tr.D.max() - tr.D).dt.days.values / 7)
+    if A.ap_weight != 1.0:
+        # [개선3] AP 직접 최적화: 양성(y=1) 행의 가중치를 ap_weight 배. 소프트 라벨 가중 w 와 곱셈 호환.
+        #   하드 양성(w=1)과 소프트 양성 행(y=1,w=q) 모두 자연스럽게 상위권으로 끌어올려 상위 정밀도를 높인다.
+        sw = sw * np.where(tr.y.values == 1, A.ap_weight, 1.0)
     sc = StandardScaler().fit(a)                      # 피처마다 평균 0, 표준편차 1 로 맞춤 (규제가 공평하게 걸리도록)
     m = LogisticRegression(C=A.C, max_iter=3000).fit(sc.transform(a), tr.y, sample_weight=sw)
     global LAST
     LAST = (m, sc, a, b)                              # SHAP 계산용으로 모델과 입력을 보관
     return m.predict_proba(sc.transform(b))[:, 1], pd.Series(m.coef_[0], a.columns)
+
+def fit_predict_em(tr, te):
+    """[개선4] 완전 EM: 최종 로지스틱 예측으로 소프트 라벨 q 를 갱신하며 재학습.
+       --q_em 가 0 이면 기존 fit_predict 와 동일(한 번 적합)."""
+    if A.q_em <= 0 or '_sk' not in tr.columns:
+        return fit_predict(tr, te)
+    tr = tr.copy()
+    soft = tr['_sk'].notna()                          # 소프트 라벨 행(잘린 날, y=1/y=0 두 줄로 복제됨)
+    pos = soft & (tr.y == 1)
+    neg = soft & (tr.y == 0)
+    key = (tr.channel_id.astype(str) + '|' + tr.D.astype(str))   # 같은 채널-날짜의 두 줄을 짝지음
+    p = None
+    for _ in range(A.q_em):
+        # M-step: 현재 가중치로 모델 적합 → 전체 학습행에 대한 예측 p (= E-step 의 책임도)
+        a, _b = design(tr, tr)
+        sw = tr.w.values * 0.5 ** ((tr.D.max() - tr.D).dt.days.values / 7)
+        if A.ap_weight != 1.0:
+            sw = sw * np.where(tr.y.values == 1, A.ap_weight, 1.0)
+        sc = StandardScaler().fit(a)
+        m = LogisticRegression(C=A.C, max_iter=3000).fit(sc.transform(a), tr.y, sample_weight=sw)
+        p = m.predict_proba(sc.transform(a))[:, 1]
+        # E-step: 소프트 날의 q 를 모델 예측으로 갱신 (y=1 행에만 예측값이 유효, 짝 행은 1-q)
+        qnew = pd.Series(p[pos.values], index=key[pos].values)
+        sk_pos = pd.Series(tr.loc[pos, '_sk'].values, index=key[pos].values)
+        tr.loc[pos, 'w'] = (key[pos].map(qnew) * key[pos].map(sk_pos)).values
+        tr.loc[neg, 'w'] = ((1 - key[neg].map(qnew)) * key[neg].map(sk_pos)).values
+    return fit_predict(tr, te)
 
 
 # ═════════════════════════════════════════════════════════════════════════════════════
@@ -532,13 +647,13 @@ elif A.validate:
         va = X[X.D == vd].copy()
         va['y'] = va.channel_id.map(label(vd, F))
         va = va[va.y.notna()]
-        p, _ = fit_predict(train_set(vd), va)         # 데이터 끝 = vd 로 학습 데이터를 만든다
+        p, _ = fit_predict_em(train_set(vd), va)      # 데이터 끝 = vd 로 학습 데이터를 만든다
         res.append((roc_auc_score(va.y, p), average_precision_score(va.y, p)))
         print(vd.date(), np.round(res[-1], 4), flush=True)
     print('평균 ROC %.4f  PR %.4f' % tuple(np.mean(res, 0)))
 else:
     te = X[X.D == TEST_D]
-    p, coef = fit_predict(train_set(TEST_D), te)
+    p, coef = fit_predict_em(train_set(TEST_D), te)
     ss['prediction'] = ss.row_id.map(dict(zip(te.channel_id + '_' + TEST_D.strftime('%Y-%m-%d'), p)))
     assert ss.prediction.notna().all(), '예측 누락 채널 있음'
     ss.to_csv(A.out, index=False)
