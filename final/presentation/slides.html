@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EPOCH 5th Datathon 본선 — 발표자료</title>
+<style>
+  :root{
+    --navy:#1a2b50; --blue:#2d5bd7; --sky:#eaf1ff; --ink:#1c2430;
+    --muted:#5b6676; --line:#d7deea; --good:#1a7f4b; --bad:#b23b3b; --gold:#b8860b;
+  }
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{font-family:"Malgun Gothic","Apple SD Gothic Neo","Noto Sans KR",sans-serif;color:var(--ink);background:#99a3b5;}
+  .slide{
+    width:1123px;height:794px;        /* A4 가로 비율(96dpi) */
+    background:#fff;margin:24px auto;position:relative;overflow:hidden;
+    padding:64px 72px;display:flex;flex-direction:column;
+    box-shadow:0 6px 24px rgba(0,0,0,.25);
+  }
+  .tag{display:inline-block;font-size:14px;letter-spacing:2px;color:var(--blue);font-weight:700;text-transform:uppercase;margin-bottom:14px;}
+  h1{font-size:48px;line-height:1.2;color:var(--navy);margin-bottom:18px;}
+  h2{font-size:34px;color:var(--navy);margin-bottom:24px;padding-bottom:12px;border-bottom:3px solid var(--blue);}
+  h3{font-size:22px;color:var(--blue);margin:18px 0 8px;}
+  p,li{font-size:19px;line-height:1.65;color:var(--ink);}
+  ul{margin-left:24px;}li{margin-bottom:8px;}
+  .sub{font-size:22px;color:var(--muted);line-height:1.5;}
+  .footer{position:absolute;bottom:28px;left:72px;right:72px;display:flex;justify-content:space-between;font-size:13px;color:var(--muted);border-top:1px solid var(--line);padding-top:10px;}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:28px;}
+  .card{background:var(--sky);border-radius:14px;padding:24px 26px;border:1px solid var(--line);}
+  .card h3{margin-top:0;}
+  .big{font-size:72px;font-weight:800;color:var(--blue);line-height:1;}
+  .big.gold{color:var(--gold);}
+  .kpi{display:flex;gap:28px;margin:20px 0;}
+  .kpi .box{flex:1;background:var(--sky);border-radius:14px;padding:22px;text-align:center;border:1px solid var(--line);}
+  .kpi .n{font-size:46px;font-weight:800;color:var(--blue);}
+  .kpi .l{font-size:15px;color:var(--muted);margin-top:6px;}
+  table{width:100%;border-collapse:collapse;margin-top:10px;font-size:18px;}
+  th,td{text-align:left;padding:11px 14px;border-bottom:1px solid var(--line);}
+  th{background:var(--navy);color:#fff;font-weight:600;}
+  tr:nth-child(even) td{background:#f6f9ff;}
+  .good{color:var(--good);font-weight:700;} .bad{color:var(--bad);font-weight:700;}
+  code{background:#eef2fb;border:1px solid var(--line);border-radius:6px;padding:2px 8px;font-size:17px;color:var(--navy);font-family:Consolas,monospace;}
+  .formula{background:var(--navy);color:#eaf1ff;border-radius:12px;padding:22px 26px;font-family:Consolas,monospace;font-size:19px;line-height:2;margin:16px 0;}
+  .flow{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:18px 0;}
+  .step{background:#fff;border:2px solid var(--blue);border-radius:12px;padding:14px 18px;font-size:17px;font-weight:600;color:var(--navy);}
+  .arrow{font-size:26px;color:var(--blue);font-weight:800;}
+  .lead{font-size:21px;color:var(--muted);margin-bottom:10px;}
+  .center{display:flex;flex-direction:column;justify-content:center;height:100%;}
+  @media print{
+    body{background:#fff;}
+    .slide{margin:0;box-shadow:none;page-break-after:always;width:100%;height:100vh;}
+  }
+</style>
+</head>
+<body>
+
+<!-- 1. 표지 -->
+<section class="slide center">
+  <div class="tag">EPOCH 5TH DATATHON · 본선</div>
+  <h1>게임 유튜브 채널<br>조회수 급등 예측</h1>
+  <p class="sub">미래 창(09-01~09-26)에 롱폼 조회수가 '평소'보다 급등할 채널을 예측<br>평가지표: PR-AUC (Average Precision)</p>
+  <div style="margin-top:40px;">
+    <span class="big gold">0.7412</span>
+    <p class="sub" style="margin-top:8px;">최종 리더보드 PR-AUC · 한때 전체 1위</p>
+  </div>
+  <div class="footer"><span>EPOCH 5th Datathon 본선 발표</span><span>Team · Chaewon-Park-STUDY/datathon</span></div>
+</section>
+
+<!-- 2. 문제 정의 -->
+<section class="slide">
+  <div class="tag">01 · Problem</div>
+  <h2>문제 정의</h2>
+  <div class="grid2">
+    <div>
+      <h3>예측 대상</h3>
+      <p>각 채널이 기준일(D) 이후 미래 구간에 올린 롱폼 영상의 조회수가,
+      그 채널의 '평소 수준'보다 크게 뛸지(상위권)를 0~1 확률로 예측.</p>
+      <h3>라벨 정의</h3>
+      <ul>
+        <li>과거 점수 = D 이전 롱폼 view_5d 중앙값</li>
+        <li>미래 점수 = D~D+F 롱폼 view_5d 중앙값</li>
+        <li>s = log(미래) − log(과거)</li>
+        <li>s 상위 20% → 라벨 1</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>평가지표: PR-AUC</h3>
+      <p>양성(급등) 비율이 ~20%로 불균형하므로
+      ROC보다 <b>PR-AUC(Average Precision)</b>가 핵심.</p>
+      <p style="margin-top:14px;">→ <b>상위권 순위</b>가 점수를 거의 결정한다.
+      상위권에 진짜 급등 채널을 많이, 정확히 올리는 것이 관건.</p>
+    </div>
+  </div>
+  <div class="footer"><span>01 · 문제 정의</span><span>0.7412 · PR-AUC</span></div>
+</section>
+
+<!-- 3. 데이터 -->
+<section class="slide">
+  <div class="tag">02 · Data</div>
+  <h2>제공 데이터</h2>
+  <table>
+    <tr><th>파일</th><th>핵심 컬럼</th><th>용도</th></tr>
+    <tr><td><code>video_5d_views.csv</code></td><td>channel_id, published_at, view_5d, is_shorts</td><td>영상별 업로드 5일 조회수 · 롱폼/숏폼 구분</td></tr>
+    <tr><td><code>channel_snapshots.csv</code></td><td>channel_id, collected_at, subscriber_count</td><td>채널 구독자 추이</td></tr>
+    <tr><td><code>train_labels.csv</code></td><td>row_id, target</td><td>과거 2개 시점(08-11, 08-25) 정답</td></tr>
+    <tr><td><code>sample_submission.csv</code></td><td>row_id, prediction</td><td>제출 양식 (694 채널 × 09-01)</td></tr>
+  </table>
+  <h3>핵심 설계 포인트</h3>
+  <ul>
+    <li>미래 조회수는 주어지지 않음 → <b>과거 신호로 미래 급등을 추론</b></li>
+    <li>직전 시점 정답(prev label)을 soft conditioning 신호로 활용</li>
+    <li>롱폼(<code>is_shorts == 0</code>)만 라벨 대상</li>
+  </ul>
+  <div class="footer"><span>02 · 데이터</span><span>0.7412 · PR-AUC</span></div>
+</section>
+
+<!-- 4. 접근 개요 -->
+<section class="slide">
+  <div class="tag">03 · Approach</div>
+  <h2>접근 — 서로 다른 두 모델의 순위 블렌딩</h2>
+  <div class="grid2">
+    <div class="card">
+      <h3>① q_joint (로지스틱 계열)</h3>
+      <p>로지스틱 회귀 + 순위 변환 기반. 과거 조회수 순위, 업로드율,
+      직전 시점 특징(lag), 관측-질 신호를 결합한 통합 모형.</p>
+      <p style="margin-top:12px;">단독 LB <b>0.7115</b></p>
+    </div>
+    <div class="card">
+      <h3>② mate (구조 시뮬레이션)</h3>
+      <p>채널별 '현재 수준(level)'을 추정하고 미래 업로드를 몬테카를로로
+      모의 생성해 급등 확률을 계산하는 구조 모델.</p>
+      <p style="margin-top:12px;">단독 LB <b>0.7395</b></p>
+    </div>
+  </div>
+  <h3>왜 블렌딩인가</h3>
+  <p>두 모델은 <b>구조가 완전히 다름</b>(통계 회귀 vs 생성 시뮬). 서로의 오차가
+  독립적이라, 순위 기반으로 결합하면 단일 모델보다 안정적으로 높은 PR-AUC를 얻는다.</p>
+  <div class="footer"><span>03 · 접근</span><span>0.7412 · PR-AUC</span></div>
+</section>
+
+<!-- 5. 최종 모델 -->
+<section class="slide">
+  <div class="tag">04 · Final Model</div>
+  <h2>최종 모델 — blend_90</h2>
+  <p class="lead">mate(90%) + q_joint(10%) 순위 기반 블렌딩</p>
+  <div class="formula">
+    rankpct(x) = x를 전체에서 백분위 순위로 변환 (0~1)<br>
+    score = <b>0.90</b> · rankpct(mate) + <b>0.10</b> · rankpct(q_joint)<br>
+    rr&nbsp;&nbsp;&nbsp; = rankpct(score)<br>
+    pred&nbsp; = 1 / (1 + exp(−8 · (rr − 0.8)))
+  </div>
+  <ul>
+    <li>PR-AUC는 <b>순위에만</b> 의존 → 순위 보존 변환이면 점수 동일</li>
+    <li>로지스틱 변환으로 상위권을 매끄럽게 분리, 제출 범위 0~1 보장</li>
+    <li>694행 · 중복/결측 없음 · 제출 형식 완전 충족</li>
+  </ul>
+  <div class="footer"><span>04 · 최종 모델</span><span>0.7412 · PR-AUC</span></div>
+</section>
+
+<!-- 6. 개선 과정 -->
+<section class="slide">
+  <div class="tag">05 · Journey</div>
+  <h2>개선 과정 — 0.7075 → 0.7412</h2>
+  <div class="flow">
+    <div class="step">2위<br>0.7075</div><span class="arrow">→</span>
+    <div class="step">lag1feat<br>직전특징</div><span class="arrow">→</span>
+    <div class="step">lag1q<br>관측-질</div><span class="arrow">→</span>
+    <div class="step">q_joint<br>0.7115</div><span class="arrow">→</span>
+    <div class="step">+ mate 블렌딩<br><b>0.7412</b></div>
+  </div>
+  <div class="kpi">
+    <div class="box"><div class="n">0.7075</div><div class="l">출발 (2위)</div></div>
+    <div class="box"><div class="n">0.7115</div><div class="l">q_joint 단독</div></div>
+    <div class="box"><div class="n">0.7395</div><div class="l">mate 단독</div></div>
+    <div class="box"><div class="n" style="color:var(--gold)">0.7412</div><div class="l">blend_90 (1위)</div></div>
+  </div>
+  <p>각 단계는 리더보드와 과거 라벨 검증으로 채택/기각을 판단. 개선이 확인된 신호만 반영.</p>
+  <div class="footer"><span>05 · 개선 과정</span><span>0.7412 · PR-AUC</span></div>
+</section>
+
+<!-- 7. 검증 규율 -->
+<section class="slide">
+  <div class="tag">06 · Validation Discipline</div>
+  <h2>검증 규율 — "쏘기 전에 데이터로 확인"</h2>
+  <p class="lead">막판 상위권 추가 개선 가설들을 과거 라벨(08-11→08-25)로 백테스트</p>
+  <table>
+    <tr><th>가설</th><th>백테스트 결과</th><th>판정</th></tr>
+    <tr><td>확실한 오답 채널을 하위로 (미래 업로드 0 가정)</td><td>해당 그룹 다음 양성률 = 전체 평균과 동일</td><td class="bad">기각</td></tr>
+    <tr><td>초반강세+라벨0 채널 하위로</td><td>표본 양성률 20% ≈ 전체 20.1%</td><td class="bad">기각</td></tr>
+    <tr><td>업로드 희박 채널 상위로 (숨은 양성)</td><td>대조군과 양성률 동일 → 자기상관일 뿐</td><td class="bad">기각</td></tr>
+    <tr><td>다른 모델(T01) 추가 블렌딩</td><td>기준선과 순위상관 0.99+ → 상방 없음</td><td class="bad">기각</td></tr>
+  </table>
+  <h3>교훈</h3>
+  <p>"그럴듯한" 상위권 손질은 대부분 <b>이미 모델에 반영된 자기상관</b>이었다.
+  검증 없는 재배치는 과적합·점수 하락 위험 → <b>검증된 blend_90 유지</b>가 최선.</p>
+  <div class="footer"><span>06 · 검증 규율</span><span>0.7412 · PR-AUC</span></div>
+</section>
+
+<!-- 8. 결론 -->
+<section class="slide center">
+  <div class="tag">07 · Conclusion</div>
+  <h2 style="border:none;">결론</h2>
+  <div class="grid2" style="margin-top:10px;">
+    <div class="card">
+      <h3>성과</h3>
+      <ul>
+        <li>2위(0.7075)에서 <b>0.7412</b>로 (한때 1위)</li>
+        <li>구조가 다른 두 모델의 순위 블렌딩</li>
+        <li>재현 가능한 노트북으로 산출물 정리</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>핵심 교훈</h3>
+      <ul>
+        <li>PR-AUC는 상위권 순위가 좌우</li>
+        <li>앙상블 다양성 &gt; 단일 모델 튜닝</li>
+        <li>모든 개선은 <b>검증 후 채택</b></li>
+      </ul>
+    </div>
+  </div>
+  <p style="text-align:center;margin-top:40px;font-size:26px;color:var(--navy);font-weight:700;">
+    감사합니다 🙂
+  </p>
+  <div class="footer"><span>07 · 결론</span><span>Chaewon-Park-STUDY/datathon</span></div>
+</section>
+
+</body>
+</html>
