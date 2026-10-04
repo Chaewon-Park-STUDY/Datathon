@@ -18,7 +18,7 @@ final/
 ├── README.md                        # 이 파일
 ├── CODE_EXPLAINED.md                # 코드별 상세 설명 (왜 이렇게 짰고 무엇을 의미하는지, Q&A 포함)
 ├── 5th_datathon_code_빡빡이.ipynb   # 최종 제출 재현 노트북 (0.7523)
-├── final_blend90.ipynb              # 위 노트북과 동일한 사본
+├── final_submission.ipynb           # 위 노트북과 동일한 사본
 └── presentation/
     ├── 5th_datathon_board_빡빡이.pdf # 대회 당일 보드
     └── 빡빡이_poster.pdf / .pptx
